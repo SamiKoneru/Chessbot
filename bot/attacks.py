@@ -55,9 +55,65 @@ def attacked_squares_by_color(board: "Board", color: Color) -> set[str]:
 
 
 def is_square_attacked(board: "Board", square: str, by_color: Color) -> bool:
-    for from_square, piece in board.iter_pieces(color=by_color):
-        if square in attacked_squares_for_piece(board, from_square, piece):
-            return True
+    """Targeted attack test: scan outward from `square` and stop at the first
+    attacker, instead of enumerating every enemy piece's full attack set.
+
+    This is the hot path for legality / check detection, so it avoids set
+    allocation, inlines bounds checks, and short-circuits.
+    """
+    rank, file = square_index(square)
+    grid = board.grid
+
+    # Pawn attackers sit one rank "behind" the diagonal that hits `square`.
+    pawn_dir = -1 if by_color is Color.WHITE else 1
+    pr = rank - pawn_dir
+    if 0 <= pr < 8:
+        for pf in (file - 1, file + 1):
+            if 0 <= pf < 8:
+                p = grid[pr][pf]
+                if p is not None and p.color is by_color and p.piece_type is PieceType.PAWN:
+                    return True
+
+    # Knight attackers.
+    for dr, df in KNIGHT_OFFSETS:
+        tr, tf = rank + dr, file + df
+        if 0 <= tr < 8 and 0 <= tf < 8:
+            p = grid[tr][tf]
+            if p is not None and p.color is by_color and p.piece_type is PieceType.KNIGHT:
+                return True
+
+    # Adjacent enemy king.
+    for dr, df in KING_OFFSETS:
+        tr, tf = rank + dr, file + df
+        if 0 <= tr < 8 and 0 <= tf < 8:
+            p = grid[tr][tf]
+            if p is not None and p.color is by_color and p.piece_type is PieceType.KING:
+                return True
+
+    # Sliding attackers: orthogonal rays (rook / queen).
+    for dr, df in ORTHOGONAL_DIRECTIONS:
+        tr, tf = rank + dr, file + df
+        while 0 <= tr < 8 and 0 <= tf < 8:
+            p = grid[tr][tf]
+            if p is not None:
+                if p.color is by_color and p.piece_type in (PieceType.ROOK, PieceType.QUEEN):
+                    return True
+                break
+            tr += dr
+            tf += df
+
+    # Sliding attackers: diagonal rays (bishop / queen).
+    for dr, df in DIAGONAL_DIRECTIONS:
+        tr, tf = rank + dr, file + df
+        while 0 <= tr < 8 and 0 <= tf < 8:
+            p = grid[tr][tf]
+            if p is not None:
+                if p.color is by_color and p.piece_type in (PieceType.BISHOP, PieceType.QUEEN):
+                    return True
+                break
+            tr += dr
+            tf += df
+
     return False
 
 

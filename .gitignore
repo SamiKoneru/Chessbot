@@ -29,4 +29,9 @@ htmlcov/
 # Local experiments / scratch notebooks (not part of the engine)
 brainstorm.ipynb
 
-tests/
+# Training artifacts — too large for git (498MB .npz exceeds GitHub's 100MB
+# limit) and re-derivable from the extract/train scripts.
+data/
+checkpoints/
+*.npz
+*.pt

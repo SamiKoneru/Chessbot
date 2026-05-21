@@ -131,7 +131,7 @@ class Board:
         self.set_piece(square, None, refresh_hash=refresh_hash)
         return existing_piece
 
-    def apply_move(self, move: Move, validate_legality: bool = False) -> None:
+    def apply_move(self, move: Move, validate_legality: bool = False, refresh_hash: bool = True) -> None:
         move = self.normalize_move(move)
         if validate_legality and not self.is_legal_move(move):
             raise ValueError(f"Illegal move for current position: {move.uci}")
@@ -167,7 +167,8 @@ class Board:
 
         self.set_piece(move.to_square, moved_piece, refresh_hash=False)
         self._update_state_after_move(move, piece, captured_piece)
-        self._refresh_zobrist_hash()
+        if refresh_hash:
+            self._refresh_zobrist_hash()
 
     def _apply_en_passant_capture(self, move: Move, piece: Piece) -> None:
         target_rank, target_file = square_index(move.to_square)

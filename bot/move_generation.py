@@ -233,7 +233,9 @@ def _castle_moves(board: "Board", king_square: str, color: Color) -> list[Move]:
 
 def _move_keeps_king_safe(board: "Board", move: Move, moving_color: Color) -> bool:
     candidate = board.clone()
-    candidate.apply_move(move)
+    # Legality only needs to know whether the king is left in check; the Zobrist
+    # hash is never read here, so skip the (expensive) full recompute.
+    candidate.apply_move(move, refresh_hash=False)
     return not candidate.is_in_check(moving_color)
 
 

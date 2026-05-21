@@ -4,13 +4,47 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from typing import Callable
+
 from .board import Board
-from .evaluation import CHECKMATE_SCORE, evaluate_for_side_to_move
-from .enums import PieceType
+from .evaluation import CHECKMATE_SCORE, evaluate_for_side_to_move as _default_evaluator
+from .enums import Color, PieceType
 from .move import Move
 from .transposition_table import BoundType, TranspositionEntry, TranspositionTable
 
 SEARCH_INFINITY = CHECKMATE_SCORE + 1
+
+# Null-move pruning parameters.
+# R is how many plies we reduce the null-move search by. R=2 is the textbook
+# default; R=3 is more aggressive but more error-prone. NULL_MIN_DEPTH stops
+# us from null-moving at depths where it isn't worth the risk.
+NULL_MOVE_R = 2
+NULL_MIN_DEPTH = 3
+
+# Check extensions: search a move that gives check one ply deeper, so forced
+# tactical sequences aren't truncated at the horizon. Bounded by ply so a
+# perpetual-check line can't extend the search forever (it would otherwise keep
+# depth constant). Past this ply, extensions stop and depth strictly decreases.
+MAX_EXTENSION_PLY = 48
+
+# The eval function used by search. Module-level so it can be swapped at runtime
+# (e.g. material baseline vs NNUE) without threading it through every function.
+_evaluator: Callable[[Board], int] = _default_evaluator
+
+
+def set_evaluator(fn: Callable[[Board], int]) -> None:
+    """Swap the leaf evaluation function used by alpha-beta and quiescence."""
+    global _evaluator
+    _evaluator = fn
+
+
+def reset_evaluator() -> None:
+    """Restore the material-only evaluator."""
+    set_evaluator(_default_evaluator)
+
+
+def evaluate_for_side_to_move(board: Board) -> int:
+    return _evaluator(board)
 
 # Keep move-order values local to search so evaluation can evolve separately.
 ORDERING_PIECE_VALUES = {
@@ -23,8 +57,37 @@ ORDERING_PIECE_VALUES = {
 }
 PROMOTION_BONUS = 10_000
 CAPTURE_BONUS = 5_000
+KILLER_BONUS = 4_000
 CASTLING_BONUS = 100
 PREFERRED_MOVE_BONUS = 100_000
+
+
+class KillerTable:
+    """Per-ply store of quiet moves that recently caused a beta cutoff.
+
+    A "killer" at ply N is a quiet move that proved strong in a sibling subtree
+    at the same ply. Trying it right after the hash move (and before generic
+    quiet moves) tends to produce more cutoffs in similar positions.
+
+    Captures aren't tracked — MVV-LVA already promotes them above quiet moves.
+    """
+
+    __slots__ = ("_killers",)
+
+    def __init__(self) -> None:
+        self._killers: dict[int, list[Move]] = {}
+
+    def add(self, ply: int, move: Move) -> None:
+        slots = self._killers.setdefault(ply, [])
+        if slots and slots[0] == move:
+            return
+        if move in slots:
+            slots.remove(move)
+        slots.insert(0, move)
+        del slots[2:]  # keep two killers per ply
+
+    def is_killer(self, ply: int, move: Move) -> bool:
+        return move in self._killers.get(ply, ())
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,12 +106,14 @@ def ordered_moves(
     board: Board,
     moves: list[Move] | None = None,
     preferred_move: Move | None = None,
+    killer_table: KillerTable | None = None,
+    ply: int = 0,
 ) -> list[Move]:
     """Order moves using a cheap search-specific heuristic."""
     candidates = board.legal_moves() if moves is None else moves
     return sorted(
         candidates,
-        key=lambda move: _move_order_score(board, move, preferred_move),
+        key=lambda move: _move_order_score(board, move, preferred_move, killer_table, ply),
         reverse=True,
     )
 
@@ -58,11 +123,13 @@ def alpha_beta_search(
     depth: int,
     preferred_move: Move | None = None,
     transposition_table: TranspositionTable | None = None,
+    killer_table: KillerTable | None = None,
 ) -> SearchResult:
     """Search the current position and return the best root move."""
     if depth < 0:
         raise ValueError(f"Search depth must be non-negative, got {depth}")
     transposition_table = TranspositionTable() if transposition_table is None else transposition_table
+    killer_table = KillerTable() if killer_table is None else killer_table
 
     if board.is_game_over():
         return SearchResult(
@@ -97,7 +164,12 @@ def alpha_beta_search(
     if root_preferred_move is None and cached_entry is not None:
         root_preferred_move = cached_entry.best_move
 
-    legal_moves = ordered_moves(board, preferred_move=root_preferred_move)
+    legal_moves = ordered_moves(
+        board,
+        preferred_move=root_preferred_move,
+        killer_table=killer_table,
+        ply=0,
+    )
     if not legal_moves:
         return SearchResult(
             score=evaluate_for_side_to_move(board),
@@ -122,6 +194,7 @@ def alpha_beta_search(
             beta=-alpha,
             ply=1,
             transposition_table=transposition_table,
+            killer_table=killer_table,
         )
         score = -child_score
 
@@ -157,6 +230,9 @@ def iterative_deepening_search(
     if max_depth < 0:
         raise ValueError(f"Search depth must be non-negative, got {max_depth}")
     transposition_table = TranspositionTable() if transposition_table is None else transposition_table
+    # Killer table is shared across iterations: killers found at depth N typically
+    # remain strong at depth N+1, so reusing them gives the deeper pass better ordering.
+    killer_table = KillerTable()
 
     if max_depth == 0:
         return alpha_beta_search(board, depth=0, transposition_table=transposition_table)
@@ -171,6 +247,7 @@ def iterative_deepening_search(
             depth=depth,
             preferred_move=preferred_move,
             transposition_table=transposition_table,
+            killer_table=killer_table,
         )
         total_nodes += latest_result.nodes_searched
         preferred_move = latest_result.best_move
@@ -182,6 +259,31 @@ def iterative_deepening_search(
     )
 
 
+def _has_non_pawn_material(board: Board, color: Color) -> bool:
+    """True if `color` has any piece other than pawns and the king.
+
+    Used to gate null-move pruning: in king-and-pawn endgames the "passing is at
+    least as good as moving" premise of null-move can fail (zugzwang).
+    """
+    for _, piece in board.iter_pieces(color):
+        if piece.piece_type not in (PieceType.PAWN, PieceType.KING):
+            return True
+    return False
+
+
+def _apply_null_move(board: Board) -> Board:
+    """Return a clone with side-to-move flipped and en-passant rights cleared.
+
+    A "null move" is just passing the turn — no piece is moved. Clearing EP
+    matches what would happen after any real non-pawn move.
+    """
+    clone = board.clone()
+    clone.state.en_passant_target = None
+    clone.state.side_to_move = clone.state.side_to_move.opposite
+    clone._refresh_zobrist_hash()
+    return clone
+
+
 def _alpha_beta(
     board: Board,
     depth: int,
@@ -189,13 +291,12 @@ def _alpha_beta(
     beta: int,
     ply: int,
     transposition_table: TranspositionTable,
+    killer_table: KillerTable,
 ) -> tuple[int, int]:
     """Negamax alpha-beta from the side-to-move perspective."""
     original_alpha = alpha
     original_beta = beta
 
-    if board.is_game_over():
-        return _terminal_score(board, ply), 1
     if depth == 0:
         return _quiescence(board, alpha, beta, ply)
 
@@ -209,10 +310,45 @@ def _alpha_beta(
     if cached_score is not None:
         return cached_score, 1
 
-    preferred_move = None if cached_entry is None else cached_entry.best_move
-    legal_moves = ordered_moves(board, preferred_move=preferred_move)
+    # Generate legal moves once and reuse them for terminal detection, null-move
+    # gating, and ordering. Terminal (no-move) detection must run BEFORE null-move
+    # pruning, otherwise we could "pass" in a stalemate and prune a drawn node.
+    legal_moves = board.legal_moves()
     if not legal_moves:
-        return evaluate_for_side_to_move(board), 1
+        return _terminal_score_no_moves(board, ply), 1
+
+    # Null-move pruning. If we can skip our turn and the opponent still can't
+    # reach beta, our position is so good they wouldn't have allowed it — prune.
+    # Guards: must not be in check (passing while in check is illegal and
+    # disastrous), must have non-pawn material (zugzwang protection), and we
+    # need enough remaining depth that the reduced search isn't trivially shallow.
+    if (
+        depth >= NULL_MIN_DEPTH
+        and not board.is_in_check()
+        and _has_non_pawn_material(board, board.state.side_to_move)
+    ):
+        null_board = _apply_null_move(board)
+        null_score, null_nodes = _alpha_beta(
+            null_board,
+            depth=depth - 1 - NULL_MOVE_R,
+            alpha=-beta,
+            beta=-beta + 1,
+            ply=ply + 1,
+            transposition_table=transposition_table,
+            killer_table=killer_table,
+        )
+        null_score = -null_score
+        if null_score >= beta:
+            return null_score, null_nodes + 1
+
+    preferred_move = None if cached_entry is None else cached_entry.best_move
+    legal_moves = ordered_moves(
+        board,
+        moves=legal_moves,
+        preferred_move=preferred_move,
+        killer_table=killer_table,
+        ply=ply,
+    )
 
     best_score = -SEARCH_INFINITY
     best_move: Move | None = None
@@ -222,13 +358,19 @@ def _alpha_beta(
         candidate = board.clone()
         candidate.apply_move(move)
 
+        # Check extension: if this move gives check (the opponent is now in
+        # check), search it one ply deeper. Bounded by ply to guarantee
+        # termination on perpetual checks.
+        extension = 1 if (ply < MAX_EXTENSION_PLY and candidate.is_in_check()) else 0
+
         child_score, child_nodes = _alpha_beta(
             candidate,
-            depth=depth - 1,
+            depth=depth - 1 + extension,
             alpha=-beta,
             beta=-alpha,
             ply=ply + 1,
             transposition_table=transposition_table,
+            killer_table=killer_table,
         )
         score = -child_score
 
@@ -239,6 +381,14 @@ def _alpha_beta(
         if score > alpha:
             alpha = score
         if alpha >= beta:
+            # Record killer for quiet cutoffs only — captures and promotions
+            # already sort above quiet moves via MVV-LVA / promotion bonus.
+            if (
+                board.piece_at(move.to_square) is None
+                and not move.is_en_passant
+                and move.promotion is None
+            ):
+                killer_table.add(ply, move)
             break
 
     transposition_table.store(
@@ -254,14 +404,19 @@ def _alpha_beta(
 
 def _quiescence(board: Board, alpha: int, beta: int, ply: int) -> tuple[int, int]:
     """Extend noisy leaf positions until they become quiet enough to evaluate."""
-    if board.is_game_over():
-        return _terminal_score(board, ply), 1
-
     nodes_searched = 1
 
-    if board.is_in_check():
+    # Generate legal moves once (replaces the redundant is_game_over() call,
+    # which itself generated moves). No legal moves => terminal: mate if in
+    # check, otherwise stalemate. This preserves exact terminal scoring.
+    in_check = board.is_in_check()
+    legal = board.legal_moves()
+    if not legal:
+        return (ply - CHECKMATE_SCORE if in_check else 0), nodes_searched
+
+    if in_check:
         best_score = -SEARCH_INFINITY
-        moves = ordered_moves(board)
+        moves = ordered_moves(board, moves=legal)
     else:
         stand_pat = evaluate_for_side_to_move(board)
         if stand_pat >= beta:
@@ -269,7 +424,7 @@ def _quiescence(board: Board, alpha: int, beta: int, ply: int) -> tuple[int, int
         if stand_pat > alpha:
             alpha = stand_pat
         best_score = stand_pat
-        moves = _quiescence_moves(board)
+        moves = _noisy_moves(board, legal)
 
     if not moves:
         return best_score, nodes_searched
@@ -296,6 +451,8 @@ def _move_order_score(
     board: Board,
     move: Move,
     preferred_move: Move | None,
+    killer_table: KillerTable | None = None,
+    ply: int = 0,
 ) -> int:
     piece = board.piece_at(move.from_square)
     if piece is None:
@@ -320,6 +477,9 @@ def _move_order_score(
     if move.is_castling:
         score += CASTLING_BONUS
 
+    if killer_table is not None and killer_table.is_killer(ply, move):
+        score += KILLER_BONUS
+
     return score
 
 
@@ -335,10 +495,23 @@ def _terminal_score(board: Board, ply: int) -> int:
     return evaluate_for_side_to_move(board)
 
 
-def _quiescence_moves(board: Board) -> list[Move]:
+def _terminal_score_no_moves(board: Board, ply: int) -> int:
+    """Terminal score when the side to move has NO legal moves.
+
+    Avoids regenerating the move list (is_checkmate/is_stalemate would): the
+    caller already established there are no legal moves, so it's mate if in
+    check, otherwise stalemate.
+    """
+    if board.is_in_check():
+        return ply - CHECKMATE_SCORE
+    return 0
+
+
+def _noisy_moves(board: Board, legal: list[Move]) -> list[Move]:
+    """Filter already-generated legal moves down to captures, promotions, and en passant."""
     moves = [
         move
-        for move in board.legal_moves()
+        for move in legal
         if move.is_en_passant
         or move.promotion is not None
         or board.piece_at(move.to_square) is not None
