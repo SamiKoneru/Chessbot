@@ -6,5 +6,8 @@
 //! weights will transfer cleanly when we add evaluation.
 
 pub mod types;
+pub mod zobrist;
 pub mod board;
+pub mod eval;
+pub mod search;
 pub mod perft;

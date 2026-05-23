@@ -1,6 +1,7 @@
 //! Bitboard board representation, FEN, attacks, move generation, make/unmake.
 
 use crate::types::*;
+use crate::zobrist::ZOBRIST;
 
 pub type Bitboard = u64;
 
@@ -117,6 +118,15 @@ pub struct Undo {
     castling: u8,
     ep: Option<Square>,
     halfmove: u16,
+    hash: u64,
+}
+
+/// Information needed to reverse a null move.
+#[derive(Clone, Copy)]
+pub struct NullUndo {
+    ep: Option<Square>,
+    halfmove: u16,
+    hash: u64,
 }
 
 #[derive(Clone)]
@@ -129,6 +139,7 @@ pub struct Board {
     ep: Option<Square>,
     pub halfmove: u16,
     pub fullmove: u16,
+    pub hash: u64,
 }
 
 impl Board {
@@ -142,6 +153,7 @@ impl Board {
             ep: None,
             halfmove: 0,
             fullmove: 1,
+            hash: 0,
         }
     }
 
@@ -194,7 +206,26 @@ impl Board {
         };
         b.halfmove = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
         b.fullmove = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+        b.hash = b.recompute_hash();
         b
+    }
+
+    /// Full Zobrist recompute (used at FEN load; make/unmake maintain it incrementally).
+    fn recompute_hash(&self) -> u64 {
+        let mut h = 0u64;
+        for sq in 0..64 {
+            if let Some((c, pt)) = self.pieces[sq] {
+                h ^= ZOBRIST.pieces[c.index()][pt.index()][sq];
+            }
+        }
+        h ^= ZOBRIST.castling[self.castling as usize];
+        if let Some(ep) = self.ep {
+            h ^= ZOBRIST.ep_file[file_of(ep) as usize];
+        }
+        if self.side == Color::Black {
+            h ^= ZOBRIST.side;
+        }
+        h
     }
 
     #[inline]
@@ -203,6 +234,7 @@ impl Board {
         let b = bit(sq);
         self.by_color[color.index()] |= b;
         self.by_type[pt.index()] |= b;
+        self.hash ^= ZOBRIST.pieces[color.index()][pt.index()][sq as usize];
     }
 
     #[inline]
@@ -212,6 +244,7 @@ impl Board {
             self.by_color[color.index()] &= b;
             self.by_type[pt.index()] &= b;
             self.pieces[sq as usize] = None;
+            self.hash ^= ZOBRIST.pieces[color.index()][pt.index()][sq as usize];
         }
     }
 
@@ -234,6 +267,24 @@ impl Board {
     #[inline]
     fn king_square(&self, color: Color) -> u8 {
         self.pieces_of(color, PieceType::King).trailing_zeros() as u8
+    }
+
+    #[inline]
+    pub fn piece_at(&self, sq: Square) -> Option<(Color, PieceType)> {
+        self.pieces[sq as usize]
+    }
+
+    #[inline]
+    pub fn count(&self, color: Color, pt: PieceType) -> u32 {
+        self.pieces_of(color, pt).count_ones()
+    }
+
+    /// True if `color` has any piece other than pawns and the king (zugzwang guard).
+    #[inline]
+    pub fn has_non_pawn_material(&self, color: Color) -> bool {
+        let c = self.by_color[color.index()];
+        let pawns_kings = self.by_type[PieceType::Pawn.index()] | self.by_type[PieceType::King.index()];
+        c & !pawns_kings != 0
     }
 
     /// Is `sq` attacked by any piece of `by`?
@@ -397,7 +448,16 @@ impl Board {
             castling: self.castling,
             ep: self.ep,
             halfmove: self.halfmove,
+            hash: self.hash,
         };
+
+        // Remove old castling / en-passant contributions from the hash; the new
+        // ones are XORed back in after those fields are updated below. (Piece
+        // moves update the hash automatically via add_piece/remove_piece.)
+        self.hash ^= ZOBRIST.castling[self.castling as usize];
+        if let Some(ep) = self.ep {
+            self.hash ^= ZOBRIST.ep_file[file_of(ep) as usize];
+        }
 
         let captured_sq = if mv.kind == MoveKind::EnPassant {
             match color {
@@ -440,6 +500,13 @@ impl Board {
             None
         };
 
+        // Re-add the (updated) castling / ep contributions and flip side-to-move.
+        self.hash ^= ZOBRIST.castling[self.castling as usize];
+        if let Some(ep) = self.ep {
+            self.hash ^= ZOBRIST.ep_file[file_of(ep) as usize];
+        }
+        self.hash ^= ZOBRIST.side;
+
         if pt == PieceType::Pawn || undo.captured.is_some() {
             self.halfmove = 0;
         } else {
@@ -450,6 +517,26 @@ impl Board {
         }
         self.side = opp;
         undo
+    }
+
+    /// Make a "null move": pass the turn (no piece moves). Used by null-move pruning.
+    pub fn make_null(&mut self) -> NullUndo {
+        let u = NullUndo { ep: self.ep, halfmove: self.halfmove, hash: self.hash };
+        if let Some(ep) = self.ep {
+            self.hash ^= ZOBRIST.ep_file[file_of(ep) as usize];
+        }
+        self.ep = None;
+        self.hash ^= ZOBRIST.side;
+        self.side = self.side.opposite();
+        self.halfmove += 1;
+        u
+    }
+
+    pub fn unmake_null(&mut self, u: NullUndo) {
+        self.side = self.side.opposite();
+        self.ep = u.ep;
+        self.halfmove = u.halfmove;
+        self.hash = u.hash;
     }
 
     pub fn unmake_move(&mut self, undo: Undo) {
@@ -493,6 +580,9 @@ impl Board {
         self.castling = undo.castling;
         self.ep = undo.ep;
         self.halfmove = undo.halfmove;
+        // Piece restores above touched the hash via add/remove; the saved
+        // pre-move hash is authoritative, so just restore it.
+        self.hash = undo.hash;
     }
 }
 
