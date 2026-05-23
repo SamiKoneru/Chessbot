@@ -5,7 +5,7 @@
 //! side-to-move's perspective).
 
 use crate::board::Board;
-use crate::eval::evaluate;
+use crate::nnue::Nnue;
 use crate::types::{Move, MoveKind, PieceType};
 
 pub const INF: i32 = 1_000_000;
@@ -49,6 +49,7 @@ const TT_MASK: usize = TT_SIZE - 1;
 pub struct Searcher {
     tt: Vec<Option<TtEntry>>,
     killers: [[Option<Move>; 2]; MAX_PLY],
+    nnue: Option<Nnue>,
     pub nodes: u64,
 }
 
@@ -57,7 +58,21 @@ impl Searcher {
         Searcher {
             tt: vec![None; TT_SIZE],
             killers: [[None; 2]; MAX_PLY],
+            nnue: None,
             nodes: 0,
+        }
+    }
+
+    /// Use the NNUE for leaf evaluation instead of the material baseline.
+    pub fn set_nnue(&mut self, nnue: Nnue) {
+        self.nnue = Some(nnue);
+    }
+
+    #[inline]
+    fn eval(&self, board: &Board) -> i32 {
+        match &self.nnue {
+            Some(n) => n.evaluate(board),
+            None => crate::eval::evaluate(board),
         }
     }
 
@@ -191,7 +206,7 @@ impl Searcher {
             best = -INF;
             self.order_moves(board, &mut moves, None, ply);
         } else {
-            let stand = evaluate(board);
+            let stand = self.eval(board);
             if stand >= beta {
                 return stand;
             }

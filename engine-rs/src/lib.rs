@@ -9,5 +9,6 @@ pub mod types;
 pub mod zobrist;
 pub mod board;
 pub mod eval;
+pub mod nnue;
 pub mod search;
 pub mod perft;

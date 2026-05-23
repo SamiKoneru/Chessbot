@@ -265,7 +265,7 @@ impl Board {
         self.by_color[color.index()] & self.by_type[pt.index()]
     }
     #[inline]
-    fn king_square(&self, color: Color) -> u8 {
+    pub fn king_square(&self, color: Color) -> u8 {
         self.pieces_of(color, PieceType::King).trailing_zeros() as u8
     }
 
