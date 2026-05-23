@@ -84,11 +84,18 @@ def main() -> None:
     ap.add_argument("--opening-plies", type=int, default=4,
                     help="Random legal moves used to seed each game pair (0 = always start position)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--opponent", default="material",
+                    help="Opponent eval: 'material' (default) or a path to another NNUE checkpoint")
     args = ap.parse_args()
 
     nnue = NNUEEvaluator.from_checkpoint(args.checkpoint)
     nnue_eval = nnue.evaluate_for_side_to_move
-    base_eval = material_eval
+    if args.opponent == "material":
+        base_eval = material_eval
+        print(f"matchup: {args.checkpoint} (NNUE) vs material baseline")
+    else:
+        base_eval = NNUEEvaluator.from_checkpoint(args.opponent).evaluate_for_side_to_move
+        print(f"matchup: {args.checkpoint} (NNUE) vs {args.opponent} (NNUE)")
     rng = random.Random(args.seed)
 
     # From NNUE's perspective: wins, draws, losses

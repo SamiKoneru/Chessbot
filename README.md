@@ -1,19 +1,27 @@
 # Chessbot
 
-A small chess engine and board-logic package written in Python: legal move
-generation, an alpha–beta search with the usual optimizations, two interchangeable
-evaluators (a material baseline and an optional **NNUE** neural-network evaluator),
-and a minimal GUI for trying it by hand.
+A chess engine in two parts:
+
+- a **Python** implementation — the engine plus a full **NNUE** neural-network
+  training and evaluation pipeline, and a minimal GUI; and
+- a **Rust** port (`engine-rs/`) being built for the raw speed needed to search
+  deeply enough that a learned evaluation actually outplays plain material counting.
+
+The Python side is the reference implementation and the ML lab; the Rust side is
+the fast engine. (Why the port: a pure-Python search tops out around a few hundred
+nodes/sec — the interpreter, not the algorithm, is the wall. The Rust move
+generator already does ~14.7M nodes/sec.)
 
 ## Project layout
 
 | Path | Purpose |
 |------|---------|
-| `bot/` | Core engine: board state, moves, evaluation, search, Zobrist hashing, transposition table. |
-| `bot/nnue/` | Optional NNUE evaluator: HalfKP feature extraction, a PyTorch model, and an inference adapter that drops into the engine in place of the material evaluator. |
-| `scripts/` | Offline tooling: extract training data from Lichess PGNs, train the NNUE, and run engine-vs-engine A/B matches. |
+| `bot/` | Python engine: board state, moves, evaluation, search, Zobrist hashing, transposition table. |
+| `bot/nnue/` | NNUE evaluator: HalfKP feature extraction, a PyTorch model, and an inference adapter that drops into the engine in place of the material evaluator. |
+| `scripts/` | Offline ML pipeline: extract/merge training data, train the NNUE, and validate/diagnose/A-B-test models. |
 | `tests/` | Unit tests for board, move generation, evaluation, search, and the transposition table. |
 | `app/` | Tkinter UI (`app/main.py`). **Barely functional** — useful for quick interactive play, not a polished product. |
+| `engine-rs/` | Rust port of the engine (bitboards, make/unmake). Move generation is **perft-validated**; search, NNUE eval, and a UCI interface are in progress. |
 
 ## Setup
 
@@ -139,6 +147,27 @@ python scripts/ab_play.py \
     --checkpoint checkpoints/nnue.pt --depth 4 --games 20 --opening-plies 4
 ```
 
+The full set of pipeline scripts:
+
+| Script | Purpose |
+|--------|---------|
+| `extract_lichess.py` | Game PGN dump → training positions (good material distribution; shallow inline evals). |
+| `extract_eval_db.py` | Lichess **evaluations** DB → positions (deep, clean Stockfish evals; no game outcome). Includes a sign-safety check. |
+| `merge_datasets.py` | Concatenate datasets (e.g. game + eval-DB) into one combined set. |
+| `train_nnue.py` | Train the model (eval/WDL blend loss; `--wdl-lambda` controls the mix). |
+| `validate_nnue.py` | Held-out correlation between the model and Stockfish — the cheap quality gate. |
+| `diagnose_nnue.py` | Material and positional sanity check on a checkpoint. |
+| `ab_play.py` | Head-to-head match: NNUE vs material, or NNUE vs another NNUE (`--opponent`). |
+| `sanity_vs_random.py` | Functional check — does the eval beat random play? |
+
+**Lessons baked into these tools:** train with `--wdl-lambda 0.0` for human-game data
+(the win/loss signal is noisy at amateur level and flattens material values); the
+eval-DB labels are cleaner but skew toward near-equal positions, so a *merged*
+dataset gives the best material understanding. Practically, a learned eval that
+correlates ~0.8 with Stockfish is roughly material-strength at shallow depth —
+its positional knowledge only becomes a decisive edge with more search depth,
+which is what the Rust port is for.
+
 ## Testing
 
 ```bash
@@ -155,17 +184,50 @@ optional engine replies with configurable search depth, and light analysis hooks
 Expect rough edges. Treat **`bot/`** as the serious component; **`app/`** as
 disposable UI glue.
 
+## Rust engine (`engine-rs/`)
+
+A from-scratch Rust port for the speed the Python engine can't reach. Built and
+validated so far:
+
+- **Bitboard board representation**, FEN parsing, attack generation.
+- **Make/unmake** moves (no per-node cloning — the main thing that crippled the
+  Python search's depth).
+- **Move generation** validated with **perft** against standard reference values
+  (start position through depth 5 = 4,865,609; Kiwipete depth 4 = 4,085,603; plus
+  an endgame position) — so castling, en passant, promotions, pins, and check
+  evasion are all provably correct.
+- **~14.7M nodes/sec** in perft, versus a few hundred for the Python engine.
+
+Square indexing is Little-Endian Rank-File (a1 = 0 … h8 = 63), matching the
+Python NNUE feature layout so trained weights transfer directly.
+
+```bash
+cd engine-rs
+cargo build --release
+cargo test --release        # perft correctness tests
+./target/release/chessbot-engine   # perft benchmark (temporary entry point)
+```
+
+**In progress:** alpha-beta search (with the Python engine's optimizations), NNUE
+inference (loading exported weights, with int8 quantization + incremental
+accumulator), and a **UCI** interface so it can plug into chess GUIs and play
+other engines.
+
 ## Development
 
 - Python 3.10+ recommended (`list[X]`, `X | Y` unions are used throughout).
+- Rust: stable toolchain (built with 1.94). `cargo build`/`cargo test` from `engine-rs/`.
 
-## Roadmap ideas
+## Roadmap
 
-- **NNUE**: incremental accumulator updates (needs make/unmake), int8 quantization,
-  larger networks, self-play fine-tuning.
-- **Search**: aspiration windows, late-move reductions (LMR), SEE-based capture
-  ordering and quiescence pruning, repetition/threefold detection in search scores.
-- **Performance**: incremental Zobrist hashing, integer-square board representation,
-  make/unmake instead of copy-make.
-- **Eval (material path)**: piece-square tables, mobility, king safety, pawn structure.
-- Opening book, time control, UCI protocol.
+**Rust engine (the active path to a genuinely stronger engine):**
+- Port the search (alpha-beta, TT, null-move, killers, check extensions, quiescence) + Zobrist hashing.
+- NNUE inference: export the trained `.pt` weights to a flat binary, load in Rust, add int8 quantization + incremental accumulator updates.
+- UCI protocol → playable in Arena / Cute Chess, testable against Stockfish at fixed nodes.
+
+**Python NNUE (largely explored):**
+- Self-play / Stockfish-binpack training data (accurate outcomes), larger networks.
+- The data experiments above showed diminishing returns — depth, not eval quality, is the current ceiling, hence the Rust port.
+
+**Python engine (lower priority):**
+- Aspiration windows, LMR, SEE; opening book; time control; piece-square tables for the material eval.

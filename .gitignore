@@ -35,3 +35,6 @@ data/
 checkpoints/
 *.npz
 *.pt
+
+# Rust build output (Cargo.lock IS committed — this is a binary crate)
+engine-rs/target/
