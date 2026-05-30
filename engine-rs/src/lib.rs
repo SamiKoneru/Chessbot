@@ -12,3 +12,4 @@ pub mod eval;
 pub mod nnue;
 pub mod search;
 pub mod perft;
+pub mod uci;

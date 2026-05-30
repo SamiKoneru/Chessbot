@@ -16,6 +16,9 @@ const WQ: u8 = 2;
 const BK: u8 = 4;
 const BQ: u8 = 8;
 
+// Piece values used by Static Exchange Evaluation (pawn..king).
+const SEE_VALUE: [i32; 6] = [100, 320, 330, 500, 900, 10_000];
+
 #[inline]
 fn bit(sq: u8) -> Bitboard {
     1u64 << sq
@@ -314,6 +317,82 @@ impl Board {
 
     pub fn in_check(&self, color: Color) -> bool {
         self.is_square_attacked(self.king_square(color), color.opposite())
+    }
+
+    /// Static Exchange Evaluation: the material the moving side nets from the
+    /// capture sequence on `mv.to`, assuming both sides recapture with their
+    /// least valuable piece. Negative means the capture loses material.
+    /// Used by quiescence to prune losing captures and gate sacrificial checks.
+    pub fn see(&self, mv: Move) -> i32 {
+        let mover = match self.pieces[mv.from as usize] {
+            Some((c, _)) => c,
+            None => return 0,
+        };
+        let (victim_value, ep_sq) = if mv.kind == MoveKind::EnPassant {
+            let ep = match mover {
+                Color::White => mv.to - 8,
+                Color::Black => mv.to + 8,
+            };
+            (SEE_VALUE[PieceType::Pawn.index()], Some(ep))
+        } else {
+            match self.pieces[mv.to as usize] {
+                Some((_, pt)) => (SEE_VALUE[pt.index()], None),
+                None => (0, None), // quiet move: SEE measures whether the dest is safe
+            }
+        };
+        let attacker_value = SEE_VALUE[self.pieces[mv.from as usize].unwrap().1.index()];
+        let mut occ = self.occupied() & !bit(mv.from);
+        if let Some(ep) = ep_sq {
+            occ &= !bit(ep);
+        }
+        victim_value - self.see_after(mv.to, attacker_value, mover.opposite(), occ)
+    }
+
+    /// Best material the `side` can win from the square `to`, given the piece
+    /// currently sitting there is worth `on_square_value`. Recursive swap-off;
+    /// each side may decline to capture (hence `.max(0)`). X-rays are handled by
+    /// recomputing slider attackers against the shrinking occupancy.
+    fn see_after(&self, to: u8, on_square_value: i32, side: Color, occ: Bitboard) -> i32 {
+        match self.least_valuable_attacker(to, side, occ) {
+            None => 0,
+            Some((sq, pt)) => {
+                let gain = on_square_value
+                    - self.see_after(to, SEE_VALUE[pt.index()], side.opposite(), occ & !bit(sq));
+                gain.max(0)
+            }
+        }
+    }
+
+    /// Least valuable piece of `side` that attacks `to` under occupancy `occ`.
+    fn least_valuable_attacker(&self, to: u8, side: Color, occ: Bitboard) -> Option<(u8, PieceType)> {
+        let mine = self.by_color[side.index()] & occ;
+        let pawns = pawn_attacks(side.opposite(), to) & mine & self.by_type[PieceType::Pawn.index()];
+        if pawns != 0 {
+            return Some((pawns.trailing_zeros() as u8, PieceType::Pawn));
+        }
+        let knights = knight_attacks(to) & mine & self.by_type[PieceType::Knight.index()];
+        if knights != 0 {
+            return Some((knights.trailing_zeros() as u8, PieceType::Knight));
+        }
+        let diag = sliding_attacks(to, occ, &DIAG);
+        let bishops = diag & mine & self.by_type[PieceType::Bishop.index()];
+        if bishops != 0 {
+            return Some((bishops.trailing_zeros() as u8, PieceType::Bishop));
+        }
+        let ortho = sliding_attacks(to, occ, &ORTHO);
+        let rooks = ortho & mine & self.by_type[PieceType::Rook.index()];
+        if rooks != 0 {
+            return Some((rooks.trailing_zeros() as u8, PieceType::Rook));
+        }
+        let queens = (diag | ortho) & mine & self.by_type[PieceType::Queen.index()];
+        if queens != 0 {
+            return Some((queens.trailing_zeros() as u8, PieceType::Queen));
+        }
+        let king = king_attacks(to) & mine & self.by_type[PieceType::King.index()];
+        if king != 0 {
+            return Some((king.trailing_zeros() as u8, PieceType::King));
+        }
+        None
     }
 
     pub fn pseudo_legal_moves(&self) -> Vec<Move> {

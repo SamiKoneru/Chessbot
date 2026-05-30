@@ -6,7 +6,9 @@ Run from the project root with:
 
 from __future__ import annotations
 
+import queue
 import sys
+import threading
 from pathlib import Path
 from time import perf_counter
 import tkinter as tk
@@ -27,6 +29,14 @@ from bot.transposition_table import TranspositionTable
 PLAYER_VS_COMPUTER_MODE = "Player vs Computer"
 TESTING_MODE = "Testing"
 AUTO_MOVE_DELAY_MS = 75
+
+# Paths to the fast Rust UCI engine and its exported NNUE weights.
+RUST_ENGINE_PATH = PROJECT_ROOT / "engine-rs" / "target" / "release" / "chessbot-engine"
+RUST_NNUE_PATH = PROJECT_ROOT / "checkpoints" / "nnue_combined.bin"
+# Safety cap on engine think time per position (also bounds the Python fallback freeze).
+MAX_THINK_SECONDS = 3.0
+# How often the UI polls for finished background analyses (ms).
+POLL_MS = 25
 
 LIGHT_SQUARE = "#f3e6c8"
 DARK_SQUARE = "#b58863"
@@ -74,19 +84,166 @@ class ChessbotApp(tk.Tk):
         self.transposition_table = TranspositionTable()
         self.auto_move_job: str | None = None
 
+        # Use the fast Rust UCI engine (with its NNUE) for play/analysis if it's
+        # built; otherwise fall back to the built-in Python search. The Rust engine
+        # is thousands of times faster, so it gets a much higher default depth.
+        self.rust_engine = None
+        self.eval_label = self._load_engine()
+        default_depth = "6" if self.rust_engine is not None else "4"
+
+        # Background-analysis plumbing (Rust path only): a worker thread runs the
+        # blocking engine query and posts results to this queue; the UI polls it on
+        # the main thread. `_gen` is an invalidation token bumped whenever in-flight
+        # analyses should be discarded (board change, new game, mode/color change).
+        self._result_q: queue.Queue = queue.Queue()
+        self._engine_lock = threading.Lock()
+        self._gen = 0
+        self._pending_move_info = None  # (gen, fen, depth, actor, start_time) or None
+        self._eval_pending_gen = None
+
         self.mode_var = tk.StringVar(value=PLAYER_VS_COMPUTER_MODE)
         self.human_color_var = tk.StringVar(value="White")
-        self.single_depth_var = tk.StringVar(value="2")
-        self.white_depth_var = tk.StringVar(value="2")
-        self.black_depth_var = tk.StringVar(value="2")
+        self.single_depth_var = tk.StringVar(value=default_depth)
+        self.white_depth_var = tk.StringVar(value=default_depth)
+        self.black_depth_var = tk.StringVar(value=default_depth)
         self.show_eval_var = tk.BooleanVar(value=True)
-        self.status_var = tk.StringVar(value="Ready.")
+        self.status_var = tk.StringVar(value=f"Ready — engine eval: {self.eval_label}")
         self.eval_label_var = tk.StringVar(value="Eval +0.00")
         self.selection_var = tk.StringVar(value="Selected: none")
 
         self._build_ui()
         self._refresh_controls()
         self._refresh_view()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(POLL_MS, self._poll_engine_results)
+
+    def _load_engine(self) -> str:
+        """Launch the fast Rust UCI engine if it's built; else fall back to the
+        Python search. Sets self.rust_engine and returns a status label.
+        """
+        self.rust_engine = None
+        if not RUST_ENGINE_PATH.exists():
+            return "Python search (build Rust: cd engine-rs && cargo build --release)"
+        try:
+            import chess.engine
+
+            engine = chess.engine.SimpleEngine.popen_uci(str(RUST_ENGINE_PATH))
+            suffix = ""
+            if RUST_NNUE_PATH.exists():
+                try:
+                    engine.configure({"NnuePath": str(RUST_NNUE_PATH)})
+                    suffix = " + NNUE"
+                except Exception:  # noqa: BLE001
+                    pass
+            self.rust_engine = engine
+            return f"Rust engine{suffix}"
+        except Exception as exc:  # noqa: BLE001 - missing python-chess / launch failure
+            return f"Python search (Rust launch failed: {exc})"
+
+    def _on_close(self) -> None:
+        self._cancel_pending_analysis()
+        if self.rust_engine is not None:
+            try:
+                self.rust_engine.quit()
+            except Exception:  # noqa: BLE001
+                pass
+        self.destroy()
+
+    # --- Background analysis (Rust path) ------------------------------------
+
+    def _cancel_pending_analysis(self) -> None:
+        """Invalidate any in-flight analysis so its result is ignored on arrival."""
+        self._gen += 1
+        self._pending_move_info = None
+        self._eval_pending_gen = None
+        self.thinking = False
+
+    def _spawn_analysis(self, gen: int, fen: str, depth: int, purpose: str) -> None:
+        """Run an engine analysis on a daemon thread; post the result to the queue.
+        The worker never touches Tk or the board — only the engine and `fen`."""
+        engine = self.rust_engine
+
+        def work() -> None:
+            raw = None
+            with self._engine_lock:
+                if engine is not None:
+                    try:
+                        raw = self._engine_analyse_raw(engine, fen, depth)
+                    except Exception:  # noqa: BLE001 - engine died / protocol error
+                        try:
+                            engine.quit()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        self.rust_engine = None
+                        raw = None
+            self._result_q.put((gen, fen, depth, purpose, raw))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _engine_analyse_raw(self, engine, fen: str, depth: int):
+        """Returns (best_uci, score_stm_relative, nodes). Runs on the worker thread."""
+        import chess
+        import chess.engine
+
+        pyboard = chess.Board(fen)
+        limit = chess.engine.Limit(depth=depth, time=MAX_THINK_SECONDS)
+        info = engine.analyse(pyboard, limit)
+        score = info["score"].pov(pyboard.turn).score(mate_score=2 * CHECKMATE_SCORE)
+        nodes = int(info.get("nodes", 0) or 0)
+        pv = info.get("pv") or []
+        best_uci = pv[0].uci() if pv else None
+        return (best_uci, score, nodes)
+
+    def _poll_engine_results(self) -> None:
+        try:
+            while True:
+                gen, fen, depth, purpose, raw = self._result_q.get_nowait()
+                if purpose == "move":
+                    self._on_move_ready(gen, fen, depth, raw)
+                else:
+                    self._on_eval_ready(gen, fen, depth, raw)
+        except queue.Empty:
+            pass
+        self.after(POLL_MS, self._poll_engine_results)
+
+    def _on_move_ready(self, gen: int, fen: str, depth: int, raw) -> None:
+        info = self._pending_move_info
+        if info is None or gen != info[0]:
+            return  # superseded request; ignore (don't disturb a newer pending move)
+        self.thinking = False
+        self._pending_move_info = None
+        if gen != self._gen:
+            self._refresh_view()
+            return  # board changed after dispatch; discard
+        _g, _f, _d, actor, started = info
+        if raw is None or raw[0] is None:
+            self._set_status("No move available.")
+            self._refresh_view()
+            return
+        best_uci, score, nodes = raw
+        move = self._uci_to_app_move(best_uci)
+        if move is None:
+            self._set_status(f"Engine returned an unexpected move: {best_uci}")
+            self._refresh_view()
+            return
+        elapsed = perf_counter() - started
+        self._apply_move(move, actor=actor, refresh=False)
+        self._set_status(
+            f"{actor} played {best_uci} at depth {depth} "
+            f"(score {score}, nodes {nodes}, {elapsed:.2f}s)."
+        )
+        self._refresh_view()
+        self._schedule_auto_move_if_needed()
+
+    def _on_eval_ready(self, gen: int, fen: str, depth: int, raw) -> None:
+        if gen != self._gen or raw is None or raw[0] is None:
+            return
+        self._eval_pending_gen = None
+        best_uci, score, nodes = raw
+        result = SearchResult(score=score, best_move=self._uci_to_app_move(best_uci), nodes_searched=nodes)
+        self.eval_display_cache = (fen, depth, result)
+        if self.show_eval_var.get():
+            self._draw_eval_bar(result, fen)
 
     def _build_ui(self) -> None:
         self.columnconfigure(0, weight=0)
@@ -243,6 +400,8 @@ class ChessbotApp(tk.Tk):
             self.self_play_controls.grid()
             self.generate_button.configure(text="Bot Move", state="normal")
         self.selected_square = None
+        self._cancel_auto_move()
+        self._cancel_pending_analysis()
         self._refresh_eval_bar_visibility()
         self._reset_eval_display()
         self._refresh_view()
@@ -256,6 +415,7 @@ class ChessbotApp(tk.Tk):
 
     def _new_game(self) -> None:
         self._cancel_auto_move()
+        self._cancel_pending_analysis()
         self.board = Board.starting_position()
         self.selected_square = None
         self.thinking = False
@@ -321,7 +481,8 @@ class ChessbotApp(tk.Tk):
 
         self._apply_move(move, actor="Human", refresh=False)
         self.selected_square = None
-        if self._is_player_vs_computer_mode():
+        if self._is_player_vs_computer_mode() and self.rust_engine is None:
+            # Rust path updates the eval bar asynchronously via _refresh_eval_bar.
             self._update_eval_display_for_current_position()
         self._refresh_view()
         self._schedule_auto_move_if_needed()
@@ -351,6 +512,7 @@ class ChessbotApp(tk.Tk):
     def _apply_move(self, move: Move, actor: str, *, refresh: bool = True) -> None:
         side = self.board.state.side_to_move.value
         self.board.apply_move(move, validate_legality=True)
+        self._gen += 1  # board changed: invalidate in-flight analyses
         self.analysis_cache = None
         self.selected_square = None
         entry = f"{len(self.move_history) + 1:>2}. {actor:<5} {side:<5} {move.uci}"
@@ -369,34 +531,34 @@ class ChessbotApp(tk.Tk):
         self._cancel_auto_move()
 
         depth = self._current_engine_depth()
-        self.thinking = True
-        if self._is_testing_mode():
-            actor = f"{self.board.state.side_to_move.value.title()} bot"
-        else:
-            actor = "Bot"
+        actor = f"{self.board.state.side_to_move.value.title()} bot" if self._is_testing_mode() else "Bot"
 
+        if self.rust_engine is not None:
+            # Non-blocking: dispatch to the worker; the move is applied in
+            # _on_move_ready when the result arrives. The UI stays responsive.
+            self.thinking = True
+            self._pending_move_info = (self._gen, self.board.to_fen(), depth, actor, perf_counter())
+            self._set_status(f"{actor} thinking at depth {depth}...")
+            self._spawn_analysis(self._gen, self.board.to_fen(), depth, "move")
+            return
+
+        # Synchronous fallback (built-in Python search). Fast enough to block briefly.
+        self.thinking = True
         self._set_status(f"{actor} thinking at depth {depth}...")
         self.update_idletasks()
-
         started = perf_counter()
-        if use_cached_analysis:
-            result = self._get_cached_analysis()
-        else:
-            result = self._analyze_current_position(depth)
+        result = self._get_cached_analysis() if use_cached_analysis else self._analyze_current_position(depth)
         elapsed = perf_counter() - started
         self.thinking = False
-
         if result.best_move is None:
             self._set_status(f"No legal moves available after {elapsed:.2f}s.")
             self._refresh_view()
             return
-
         self._apply_move(result.best_move, actor=actor, refresh=False)
         self._set_status(
             f"{actor} played {result.best_move.uci} at depth {depth} "
             f"(score {result.score}, nodes {result.nodes_searched}, {elapsed:.2f}s)."
         )
-
         self._refresh_view()
 
     def _refresh_view(self) -> None:
@@ -436,16 +598,38 @@ class ChessbotApp(tk.Tk):
         if not self.show_eval_var.get():
             return
 
-        eval_context = self._current_eval_context()
-        if eval_context is None:
-            self.eval_label_var.set("Eval --")
-            self.eval_canvas.delete("all")
+        fen = self.board.to_fen()
+        depth = self._current_engine_depth()
+
+        if self.rust_engine is None:
+            # Synchronous fallback (fast Python search): original behavior.
+            eval_context = self._current_eval_context()
+            if eval_context is None:
+                self.eval_label_var.set("Eval --")
+                self.eval_canvas.delete("all")
+                return
+            analysis_fen, _depth, analysis = eval_context
+            self._draw_eval_bar(analysis, analysis_fen)
             return
 
-        analysis_fen, _depth, analysis = eval_context
+        # Rust path: draw from cache if it matches the current position, else
+        # request a background eval (without blocking) and show a placeholder.
+        if self.eval_display_cache is not None:
+            cached_fen, _cached_depth, cached_result = self.eval_display_cache
+            if cached_fen == fen:
+                self._draw_eval_bar(cached_result, cached_fen)
+                return
+        self.eval_label_var.set("Eval …")
+        # Don't compute an eval while a move is being searched — the board is
+        # about to change, and the move search already occupies the engine.
+        if not self.thinking and self._eval_pending_gen != self._gen:
+            self._eval_pending_gen = self._gen
+            self._spawn_analysis(self._gen, fen, depth, "eval")
+
+    def _draw_eval_bar(self, analysis: SearchResult, fen: str) -> None:
         score = self._score_from_white_perspective(
             analysis.score,
-            side_to_move=self._side_to_move_from_fen(analysis_fen),
+            side_to_move=self._side_to_move_from_fen(fen),
         )
         best_move = None if analysis.best_move is None else analysis.best_move.uci
         self.eval_label_var.set(self._format_eval_label(score, best_move))
@@ -486,6 +670,12 @@ class ChessbotApp(tk.Tk):
         return result
 
     def _analyze_current_position(self, depth: int) -> SearchResult:
+        if self.rust_engine is not None:
+            result = self._analyze_with_rust(depth)
+            if result is not None:
+                self.analysis_cache = (self.board.to_fen(), depth, result)
+                return result
+        # Fallback: built-in Python search.
         result = alpha_beta_search(
             self.board,
             depth=depth,
@@ -493,6 +683,37 @@ class ChessbotApp(tk.Tk):
         )
         self.analysis_cache = (self.board.to_fen(), depth, result)
         return result
+
+    def _analyze_with_rust(self, depth: int) -> SearchResult | None:
+        """Query the Rust UCI engine. Returns a SearchResult (score side-to-move
+        relative, matching the Python search), or None if the engine errors —
+        in which case we drop it and fall back to the Python search."""
+        try:
+            import chess
+            import chess.engine
+
+            pyboard = chess.Board(self.board.to_fen())
+            limit = chess.engine.Limit(depth=depth, time=MAX_THINK_SECONDS)
+            info = self.rust_engine.analyse(pyboard, limit)
+            # Score from the side-to-move's perspective (negamax convention).
+            score = info["score"].pov(pyboard.turn).score(mate_score=2 * CHECKMATE_SCORE)
+            nodes = int(info.get("nodes", 0) or 0)
+            pv = info.get("pv") or []
+            best_move = self._uci_to_app_move(pv[0].uci()) if pv else None
+            return SearchResult(score=score, best_move=best_move, nodes_searched=nodes)
+        except Exception:  # noqa: BLE001 - engine died / protocol error
+            try:
+                self.rust_engine.quit()
+            except Exception:  # noqa: BLE001
+                pass
+            self.rust_engine = None
+            return None
+
+    def _uci_to_app_move(self, uci_str: str) -> Move | None:
+        for move in self.board.legal_moves():
+            if move.uci == uci_str:
+                return move
+        return None
 
     def _current_eval_context(self) -> tuple[str, int, SearchResult] | None:
         if self._is_testing_mode():
@@ -510,7 +731,9 @@ class ChessbotApp(tk.Tk):
 
     def _reset_eval_display(self) -> None:
         self.eval_display_cache = None
-        if self._is_player_vs_computer_mode():
+        # Rust path repopulates the eval bar asynchronously; only the synchronous
+        # Python fallback precomputes it here.
+        if self._is_player_vs_computer_mode() and self.rust_engine is None:
             self._update_eval_display_for_current_position()
 
     def _is_player_vs_computer_mode(self) -> bool:
@@ -527,6 +750,7 @@ class ChessbotApp(tk.Tk):
     def _on_human_color_changed(self) -> None:
         self.selected_square = None
         self._cancel_auto_move()
+        self._cancel_pending_analysis()
         self._reset_eval_display()
         self._refresh_view()
         self._schedule_auto_move_if_needed()
