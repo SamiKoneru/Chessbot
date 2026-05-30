@@ -24,11 +24,10 @@ fn validate(nnue: &Nnue, board: &mut Board, acc: &AccPair, depth: u32) {
     let fresh = nnue.refresh(board);
     for p in 0..2 {
         for i in 0..HIDDEN {
-            assert!(
-                (acc[p][i] - fresh[p][i]).abs() < 1e-3,
+            assert_eq!(
+                acc[p][i], fresh[p][i],
                 "accumulator drift at perspective {p}, unit {i}: incremental {} vs refresh {}",
-                acc[p][i],
-                fresh[p][i]
+                acc[p][i], fresh[p][i]
             );
         }
     }

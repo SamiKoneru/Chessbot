@@ -91,6 +91,26 @@ def collate(batch):
     )
 
 
+# Quantization-aware-training (QAT) clamps. Dense weights are quantized at
+# export with scale 64 into int8 [-127, 127], so the float weights must stay
+# within ±127/64 ≈ ±1.98 for lossless quantization. We use ±2.0 to leave a
+# rounding margin. The feature transformer (stored as int16, scale 127) has
+# vastly more headroom; we still clamp loosely (±256/127) to bound activations.
+QAT_DENSE_CLAMP = 127.0 / 64.0  # ≈ 1.984
+QAT_FT_CLAMP = 256.0 / 127.0    # ≈ 2.016
+
+
+def apply_qat_clamps(model) -> None:
+    """Constrain weights to the int8/int16 representable range. Call after each
+    optimizer step so the network adapts to quantization-compatible weights."""
+    with torch.no_grad():
+        model.feature_transformer.weight.clamp_(-QAT_FT_CLAMP, QAT_FT_CLAMP)
+        model.feature_bias.clamp_(-QAT_FT_CLAMP, QAT_FT_CLAMP)
+        model.fc1.weight.clamp_(-QAT_DENSE_CLAMP, QAT_DENSE_CLAMP)
+        model.fc2.weight.clamp_(-QAT_DENSE_CLAMP, QAT_DENSE_CLAMP)
+        model.fc_out.weight.clamp_(-QAT_DENSE_CLAMP, QAT_DENSE_CLAMP)
+
+
 def train(
     data_path: Path,
     output_path: Path,
@@ -101,6 +121,7 @@ def train(
     wdl_lambda: float,
     val_split: float,
     device: str,
+    qat: bool,
 ) -> None:
     dev = torch.device(device)
     dataset = PositionDataset(data_path)
@@ -141,6 +162,8 @@ def train(
             loss = step_loss(batch)
             loss.backward()
             opt.step()
+            if qat:
+                apply_qat_clamps(model)
             running += loss.item() * batch[4].size(0)
             n_seen += batch[4].size(0)
             if i % 200 == 0:
@@ -182,10 +205,16 @@ def main() -> None:
         "--device",
         default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
     )
+    ap.add_argument(
+        "--qat",
+        action="store_true",
+        help="Quantization-aware training: clamp weights to int8/int16 range each step "
+             "so the model quantizes cleanly when exported. Use this for production runs.",
+    )
     args = ap.parse_args()
     train(
         args.data, args.output, args.hidden, args.batch_size, args.epochs,
-        args.lr, args.wdl_lambda, args.val_split, args.device,
+        args.lr, args.wdl_lambda, args.val_split, args.device, args.qat,
     )
 
 

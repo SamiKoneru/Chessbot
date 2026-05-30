@@ -36,9 +36,21 @@ fn bench(nnue_path: Option<&str>) {
 
     let fens = [
         ("startpos", "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
+        ("white +Q", "rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"),
         ("italian", "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"),
         ("midgame", "r1bq1rk1/pp2bppp/2n2n2/2pp4/3P4/2N1PN2/PP3PPP/R1BQKB1R w KQ - 0 7"),
     ];
+
+    // Direct leaf-eval print (cross-check against the Python NNUE evaluator).
+    if let Some(p) = nnue_path {
+        let nnue = Nnue::load(p).expect("failed to load NNUE");
+        println!("\nNNUE leaf eval (stm-relative cp) — compare with the Python evaluator:");
+        for (name, fen) in fens {
+            let board = Board::from_fen(fen);
+            println!("  {name:<10} {}", nnue.evaluate(&board));
+        }
+    }
+
     let label = if nnue_path.is_some() { "NNUE" } else { "material" };
     println!("\nsearch demo ({label} eval), depth 6:");
     for (name, fen) in fens {

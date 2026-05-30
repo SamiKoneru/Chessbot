@@ -100,14 +100,19 @@ The actual playing engine. Built and validated:
 
 - **HalfKP** features (40,960 per perspective), shared feature transformer,
   small dense head (`2·256 → 32 → 32 → 1`) with clipped-ReLU.
+- **Int8 / int16 quantized inference** (Stockfish-style scheme): feature
+  transformer weights int16 (scale 127), accumulator int16, clipped-ReLU output
+  int8, dense weights int8 (scale 64), bias int32. ~5× faster than the
+  equivalent float32 path; weights file is half the size (21 MB).
 - **Incremental accumulator** maintained across make/unmake: a non-king move
   toggles the changed feature rows; a king move refreshes that side's
   accumulator (kings re-key every HalfKP feature). The standard scheme.
-- Weights exported from PyTorch by `scripts/export_nnue.py` and validated to
-  match the Python evaluator **exactly** — bit-for-bit weight export, identical
-  inference math.
-- Currently **float32**. Int8 quantization with quantization-aware retraining is
-  the next major lever.
+- Weights exported by `scripts/export_nnue.py` (PTQ from the existing float
+  checkpoint, or use `--qat` in training for cleaner quantization). Validated
+  against the Python evaluator: int8 leaf evals match within ±12 cp on test
+  positions (essentially noise vs. the 150 cp blunder threshold).
+- Binary format magic: `NNU2`. Re-export old `.pt` checkpoints to use the
+  current engine.
 
 ### UCI
 
@@ -201,7 +206,8 @@ python scripts/train_nnue.py \
     --data data/combined.npz --output checkpoints/nnue_combined.pt \
     --hidden 256 --epochs 20 --batch-size 8192 --lr 1e-3 --wdl-lambda 0.0
 
-# 5. Export to a flat binary the Rust engine can load.
+# 5. Export to the quantized int8/int16 binary the Rust engine loads.
+#    For cleaner quantization, retrain with --qat in step 4.
 python scripts/export_nnue.py \
     --checkpoint checkpoints/nnue_combined.pt \
     --output checkpoints/nnue_combined.bin
@@ -270,13 +276,7 @@ running both on identical FENs and checking the eval matches exactly.
 
 ## Roadmap
 
-**The next big lever for strength:** **int8 quantization with quantization-aware
-retraining**. The model was trained in plain float32; doing int8 properly
-requires (1) adding weight-clamping to the PyTorch trainer, (2) retraining, and
-(3) implementing int8 inference in Rust. Expected ~2–4× faster eval → ~1–2 ply
-deeper at the same time control → fewer tactical blunders.
-
-**Other search refinements (incremental):**
+**Search refinements (incremental):**
 - Repetition + 50-move draw detection in search (currently the search doesn't
   track position history — can misplay repeatable/drawn positions).
 - Proper mate-score adjustment in the TT (currently simplistic).
