@@ -42,3 +42,6 @@ engine-rs/target/
 # Match/analysis outputs (transient experiment artifacts, not source)
 *.pgn
 *.bin
+
+# API keys / secrets
+apis.txt
